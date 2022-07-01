@@ -1,0 +1,20 @@
+{
+    "name": "uMMORPG",
+    "rootNamespace": "",
+    "references": [
+        "Mirror",
+        "Mirror.Components",
+        "Navigation2D",
+        "SQLite-net",
+        "Unity.2D.PixelPerfect"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

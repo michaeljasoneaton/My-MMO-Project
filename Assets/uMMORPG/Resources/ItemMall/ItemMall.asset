@@ -1,0 +1,30 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3059bffe2f7494cba89f318125b7987d, type: 3}
+  m_Name: ItemMall
+  m_EditorClassIdentifier: 
+  categories:
+  - category: Potions
+    items:
+    - {fileID: 11400000, guid: efcd52c07805b4550930638bb90d380c, type: 2}
+    - {fileID: 11400000, guid: 38cf787e5075f420a94548551ce92f7f, type: 2}
+    - {fileID: 11400000, guid: 26b404de2c160499bab1fcda06a555f4, type: 2}
+  - category: Equipment
+    items:
+    - {fileID: 11400000, guid: 4dc493627ec434f5dadf44c28f65c795, type: 2}
+  - category: Pets
+    items:
+    - {fileID: 11400000, guid: 0673a99a171f7418e918fed69b37622c, type: 2}
+    - {fileID: 11400000, guid: 7c79c11de18f2441c88df3e38606ccda, type: 2}
+  - category: Monster Scrolls
+    items:
+    - {fileID: 11400000, guid: 28e020df4f1fa449dafcad0216c8403b, type: 2}
