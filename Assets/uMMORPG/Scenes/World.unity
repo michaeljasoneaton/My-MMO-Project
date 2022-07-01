@@ -80062,7 +80062,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: da3cf03c51ae5478ba91e7318f7e6cc1, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  databaseFile: Database.sqlite
+  serverIP: 127.0.0.1
+  port: 49153
+  userID: root
+  password: mysqlpw
+  sslMode: 1
   onConnected:
     m_PersistentCalls:
       m_Calls: []

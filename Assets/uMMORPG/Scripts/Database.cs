@@ -1,199 +1,41 @@
-﻿// Saves Character Data in a SQLite database. We use SQLite for several reasons
-//
-// - SQLite is file based and works without having to setup a database server
-//   - We can 'remove all ...' or 'modify all ...' easily via SQL queries
-//   - A lot of people requested a SQL database and weren't comfortable with XML
-//   - We can allow all kinds of character names, even chinese ones without
-//     breaking the file system.
-// - We will need MYSQL or similar when using multiple server instances later
-//   and upgrading is trivial
-// - XML is easier, but:
-//   - we can't easily read 'just the class of a character' etc., but we need it
-//     for character selection etc. often
-//   - if each account is a folder that contains players, then we can't save
-//     additional account info like password, banned, etc. unless we use an
-//     additional account.xml file, which over-complicates everything
-//   - there will always be forbidden file names like 'COM', which will cause
-//     problems when people try to create accounts or characters with that name
-//
-// About item mall coins:
-//   The payment provider's callback should add new orders to the
-//   character_orders table. The server will then process them while the player
-//   is ingame. Don't try to modify 'coins' in the character table directly.
-//
-// Tools to open sqlite database files:
-//   Windows/OSX program: http://sqlitebrowser.org/
-//   Firefox extension: https://addons.mozilla.org/de/firefox/addon/sqlite-manager/
-//   Webhost: Adminer/PhpLiteAdmin
-//
-// About performance:
-// - It's recommended to only keep the SQLite connection open while it's used.
-//   MMO Servers use it all the time, so we keep it open all the time. This also
-//   allows us to use transactions easily, and it will make the transition to
-//   MYSQL easier.
-// - Transactions are definitely necessary:
-//   saving 100 players without transactions takes 3.6s
-//   saving 100 players with transactions takes    0.38s
-// - Using tr = conn.BeginTransaction() + tr.Commit() and passing it through all
-//   the functions is ultra complicated. We use a BEGIN + END queries instead.
-//
-// Some benchmarks:
-//   saving 100 players unoptimized: 4s
-//   saving 100 players always open connection + transactions: 3.6s
-//   saving 100 players always open connection + transactions + WAL: 3.6s
-//   saving 100 players in 1 'using tr = ...' transaction: 380ms
-//   saving 100 players in 1 BEGIN/END style transactions: 380ms
-//   saving 100 players with XML: 369ms
-//   saving 1000 players with mono-sqlite @ 2019-10-03: 843ms
-//   saving 1000 players with sqlite-net  @ 2019-10-03:  90ms (!)
-//
-// Build notes:
-// - requires Player settings to be set to '.NET' instead of '.NET Subset',
-//   otherwise System.Data.dll causes ArgumentException.
-// - requires sqlite3.dll x86 and x64 version for standalone (windows/mac/linux)
-//   => found on sqlite.org website
-// - requires libsqlite3.so x86 and armeabi-v7a for android
-//   => compiled from sqlite.org amalgamation source with android ndk r9b linux
-using UnityEngine;
-using Mirror;
 using System;
-using System.IO;
 using System.Collections.Generic;
-using SQLite;
+using System.Linq;
+using Mirror;
+using SimpleStack.Orm;
+using SimpleStack.Orm.Attributes;
+using SimpleStack.Orm.MySQLConnector;
+using UnityEngine;
 using UnityEngine.Events;
 
-// from https://github.com/praeclarum/sqlite-net
+public enum MySqlSSLMode : byte { None, Preferred, Required, VerifyCA, VerifyFull };
 
 public partial class Database : MonoBehaviour
 {
+
     // singleton for easier access
     public static Database singleton;
 
-    // file name
-    public string databaseFile = "Database.sqlite";
+    public OrmConnectionFactory connFactory;
+    // connection (public so it can be used by addons)
+    public OrmConnection connection;
 
-    // connection
-    SQLiteConnection connection;
-
-    // database layout via .NET classes:
-    // https://github.com/praeclarum/sqlite-net/wiki/GettingStarted
-    class accounts
-    {
-        [PrimaryKey] // important for performance: O(log n) instead of O(n)
-        public string name { get; set; }
-        public string password { get; set; }
-        // created & lastlogin for statistics like CCU/MAU/registrations/...
-        public DateTime created { get; set; }
-        public DateTime lastlogin { get; set; }
-        public bool banned { get; set; }
-    }
-    class characters
-    {
-        [PrimaryKey] // important for performance: O(log n) instead of O(n)
-        [Collation("NOCASE")] // [COLLATE NOCASE for case insensitive compare. this way we can't both create 'Archer' and 'archer' as characters]
-        public string name { get; set; }
-        [Indexed] // add index on account to avoid full scans when loading characters
-        public string account { get; set; }
-        public string classname { get; set; } // 'class' isn't available in C#
-        public float x { get; set; }
-        public float y { get; set; }
-        public int level { get; set; }
-        public int health { get; set; }
-        public int mana { get; set; }
-        public int strength { get; set; }
-        public int intelligence { get; set; }
-        public long experience { get; set; } // TODO does long work?
-        public long skillExperience { get; set; } // TODO does long work?
-        public long gold { get; set; } // TODO does long work?
-        public long coins { get; set; } // TODO does long work?
-        // online status can be checked from external programs with either just
-        // just 'online', or 'online && (DateTime.UtcNow - lastsaved) <= 1min)
-        // which is robust to server crashes too.
-        public bool online { get; set; }
-        public DateTime lastsaved { get; set; }
-        public bool deleted { get; set; }
-    }
-    class character_inventory
-    {
-        public string character { get; set; }
-        public int slot { get; set; }
-        public string name { get; set; }
-        public int amount { get; set; }
-        public int summonedHealth { get; set; }
-        public int summonedLevel { get; set; }
-        public long summonedExperience { get; set; } // TODO does long work?
-        // PRIMARY KEY (character, slot) is created manually.
-    }
-    class character_equipment : character_inventory // same layout
-    {
-        // PRIMARY KEY (character, slot) is created manually.
-    }
-    class character_itemcooldowns
-    {
-        [PrimaryKey] // important for performance: O(log n) instead of O(n)
-        public string character { get; set; }
-        public string category { get; set; }
-        public float cooldownEnd { get; set; }
-    }
-    class character_skills
-    {
-        public string character { get; set; }
-        public string name { get; set; }
-        public int level { get; set; }
-        public float castTimeEnd { get; set; }
-        public float cooldownEnd { get; set; }
-        // PRIMARY KEY (character, name) is created manually.
-    }
-    class character_buffs
-    {
-        public string character { get; set; }
-        public string name { get; set; }
-        public int level { get; set; }
-        public float buffTimeEnd { get; set; }
-        // PRIMARY KEY (character, name) is created manually.
-    }
-    class character_quests
-    {
-        public string character { get; set; }
-        public string name { get; set; }
-        public int progress { get; set; }
-        public bool completed { get; set; }
-        // PRIMARY KEY (character, name) is created manually.
-    }
-    class character_orders
-    {
-        // INTEGER PRIMARY KEY is auto incremented by sqlite if the insert call
-        // passes NULL for it.
-        [PrimaryKey] // important for performance: O(log n) instead of O(n)
-        public int orderid { get; set; }
-        public string character { get; set; }
-        public long coins { get; set; }
-        public bool processed { get; set; }
-    }
-    class character_guild
-    {
-        // guild members are saved in a separate table because instead of in a
-        // characters.guild field because:
-        // * guilds need to be resaved independently, not just in CharacterSave
-        // * kicked members' guilds are cleared automatically because we drop
-        //   and then insert all members each time. otherwise we'd have to
-        //   update the kicked member's guild field manually each time
-        // * it's easier to remove / modify the guild feature if it's not hard-
-        //   coded into the characters table
-        [PrimaryKey] // important for performance: O(log n) instead of O(n)
-        public string character { get; set; }
-        // add index on guild to avoid full scans when loading guild members
-        [Indexed]
-        public string guild { get; set; }
-        public int rank { get; set; }
-    }
-    class guild_info
-    {
-        // guild master is not in guild_info in case we need more than one later
-        [PrimaryKey] // important for performance: O(log n) instead of O(n)
-        public string name { get; set; }
-        public string notice { get; set; }
-    }
+    // Database settings
+    public string serverIP = "127.0.0.1"; // localhost for development
+    public string port = "3306"; // default mysql port is 3306
+    public string userID = "root"; // should never be root in production
+    public string password = "password"; // should never be hardcoded in production (even through the editor)
+    // keep databaseName case insensitive, some dbs support case others don't so its better to assum no case
+    public const string databaseName = "ummorpg2d"; // doesn't need to exist, schema will be generated
+    /* SSL mode options
+     * Preferred - (this is the default). Use SSL if the server supports it.
+     * None - Do not use SSL.
+     * Required - Always use SSL. Deny connection if server does not support SSL. Does not validate CA or hostname.
+     * VerifyCA - Always use SSL. Validates the CA but tolerates hostname mismatch.
+     * VerifyFull - Always use SSL. Validates CA and hostname.
+     */
+    public MySqlSSLMode sslMode = MySqlSSLMode.Preferred;
+    
 
     [Header("Events")]
     // use onConnected to create an extra table for your addon
@@ -207,52 +49,45 @@ public partial class Database : MonoBehaviour
         if (singleton == null) singleton = this;
     }
 
-    // connect /////////////////////////////////////////////////////////////////
-    // only call this from the server, not from the client. otherwise the client
-    // would create a database file / webgl would throw errors, etc.
+    // connect
+    // only call this from the server, not from the client.
     public void Connect()
     {
-        // database path: Application.dataPath is always relative to the project,
-        // but we don't want it inside the Assets folder in the Editor (git etc.),
-        // instead we put it above that.
-        // we also use Path.Combine for platform independent paths
-        // and we need persistentDataPath on android
 #if UNITY_EDITOR
-        string path = Path.Combine(Directory.GetParent(Application.dataPath).FullName, databaseFile);
+        string connectionString = "server=" + serverIP + ";port=" + port +
+            ";uid=" + userID + ";pwd=" + password +
+            ";sslmode=" + sslMode + ";AllowPublicKeyRetrieval=true" +
+            ";AllowUserVariables=true;ApplicationName=" + Application.productName;
 #elif UNITY_ANDROID
-        string path = Path.Combine(Application.persistentDataPath, databaseFile);
+        Debug.LogError("MySql is not supported on this platform");
 #elif UNITY_IOS
-        string path = Path.Combine(Application.persistentDataPath, databaseFile);
+        Debug.LogError("MySql is not supported on this platform");
 #else
-        string path = Path.Combine(Application.dataPath, databaseFile);
-#endif
-
+        string connectionString = "server=" + serverIP + ";port=" + port +
+            ";uid=" + userID + ";pwd=" + password + ";sslmode=" + sslMode +
+            ";AllowUserVariables=true;ApplicationName=" + Application.productName;
+#endif 
         // open connection
-        // note: automatically creates database file if not created yet
-        connection = new SQLiteConnection(path);
+        connFactory = new OrmConnectionFactory(new MySqlConnectorDialectProvider(), connectionString);
+        connection = connFactory.OpenConnection();
 
-        // create tables if they don't exist yet or were deleted
-        connection.CreateTable<accounts>();
-        connection.CreateTable<characters>();
-        connection.CreateTable<character_inventory>();
-        connection.CreateIndex(nameof(character_inventory), new []{"character", "slot"});
-        connection.CreateTable<character_equipment>();
-        connection.CreateIndex(nameof(character_equipment), new []{"character", "slot"});
-        connection.CreateTable<character_itemcooldowns>();
-        connection.CreateTable<character_skills>();
-        connection.CreateIndex(nameof(character_skills), new []{"character", "name"});
-        connection.CreateTable<character_buffs>();
-        connection.CreateIndex(nameof(character_buffs), new []{"character", "name"});
-        connection.CreateTable<character_quests>();
-        connection.CreateIndex(nameof(character_quests), new []{"character", "name"});
-        connection.CreateTable<character_orders>();
-        connection.CreateTable<character_guild>();
-        connection.CreateTable<guild_info>();
+        connection.CreateSchemaIfNotExists(databaseName);
+        connection.CreateTableIfNotExists<Account>();
+        connection.CreateTableIfNotExists<Character>();
+        connection.CreateTableIfNotExists<CharacterInventory>();
+        connection.CreateTableIfNotExists<CharacterEquipment>();
+        connection.CreateTableIfNotExists<CharacterItemCooldown>();
+        connection.CreateTableIfNotExists<CharacterSkill>();
+        connection.CreateTableIfNotExists<CharacterBuff>();
+        connection.CreateTableIfNotExists<CharacterQuest>();
+        connection.CreateTableIfNotExists<CharacterOrders>();
+        connection.CreateTableIfNotExists<CharacterGuild>();
+        connection.CreateTableIfNotExists<GuildInfo>();
 
         // addon system hooks
         onConnected.Invoke();
 
-        //Debug.Log("connected to database");
+        Debug.Log("MySQL Database connection established");
     }
 
     // close connection when Unity closes to prevent locking
@@ -265,7 +100,7 @@ public partial class Database : MonoBehaviour
     // try to log in with an account.
     // -> not called 'CheckAccount' or 'IsValidAccount' because it both checks
     //    if the account is valid AND sets the lastlogin field
-    public bool TryLogin(string account, string password)
+    public bool TryLogin(string name, string password)
     {
         // this function can be used to verify account credentials in a database
         // or a content management system.
@@ -276,7 +111,7 @@ public partial class Database : MonoBehaviour
         //
         //   var request = new WWW("example.com/verify.php?id="+id+"&amp;pw="+pw);
         //   while (!request.isDone)
-        //       print("loading...");
+        //       Debug.Log("loading...");
         //   return request.error == null && request.text == "ok";
         //
         // where verify.php is a script like this one:
@@ -306,18 +141,22 @@ public partial class Database : MonoBehaviour
         // no CMS communication necessary and good enough for an Indie MMORPG.
 
         // not empty?
-        if (!string.IsNullOrWhiteSpace(account) && !string.IsNullOrWhiteSpace(password))
+        if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(password))
         {
             // demo feature: create account if it doesn't exist yet.
-            // note: sqlite-net has no InsertOrIgnore so we do it in two steps
-            if (connection.FindWithQuery<accounts>("SELECT * FROM accounts WHERE name=?", account) == null)
-                connection.Insert(new accounts{ name=account, password=password, created=DateTime.UtcNow, lastlogin=DateTime.Now, banned=false});
+            Account account = connection.FirstOrDefault<Account>(q => q.name == name);
+            if (account == null)
+            {
+                connection.Insert<Account>(new Account { name = name, password = password, created = DateTime.UtcNow, lastlogin = DateTime.Now, banned = false });
+                return true;
+            }
 
             // check account name, password, banned status
-            if (connection.FindWithQuery<accounts>("SELECT * FROM accounts WHERE name=? AND password=? and banned=0", account, password) != null)
+            else if (!account.banned && account.password == password)
             {
                 // save last login time and return true
-                connection.Execute("UPDATE accounts SET lastlogin=? WHERE name=?", DateTime.UtcNow, account);
+                account.lastlogin = DateTime.UtcNow;
+                connection.Update<Account>(account);
                 return true;
             }
         }
@@ -329,13 +168,13 @@ public partial class Database : MonoBehaviour
     {
         // checks deleted ones too so we don't end up with duplicates if we un-
         // delete one
-        return connection.FindWithQuery<characters>("SELECT * FROM characters WHERE name=?", characterName) != null;
+        return connection.FirstOrDefault<Character>(q => q.name == characterName) != null;
     }
 
     public void CharacterDelete(string characterName)
     {
         // soft delete the character so it can always be restored later
-        connection.Execute("UPDATE characters SET deleted=1 WHERE name=?", characterName);
+        connection.UpdateAll<Character>(new {deleted = true}, x => x.name == characterName);
     }
 
     // returns the list of character names for that account
@@ -343,8 +182,10 @@ public partial class Database : MonoBehaviour
     public List<string> CharactersForAccount(string account)
     {
         List<string> result = new List<string>();
-        foreach (characters character in connection.Query<characters>("SELECT * FROM characters WHERE account=? AND deleted=0", account))
+        foreach (Character character in connection.Select<Character>(q => q.account == account && q.deleted == false))
+        {
             result.Add(character.name);
+        }
         return result;
     }
 
@@ -356,14 +197,13 @@ public partial class Database : MonoBehaviour
 
         // then load valid items and put into their slots
         // (one big query is A LOT faster than querying each slot separately)
-        foreach (character_inventory row in connection.Query<character_inventory>("SELECT * FROM character_inventory WHERE character=?", inventory.name))
+        foreach (CharacterInventory row in connection.Select<CharacterInventory>(q => q.character == inventory.name))
         {
             if (row.slot < inventory.size)
             {
                 if (ScriptableItem.All.TryGetValue(row.name.GetStableHashCode(), out ScriptableItem itemData))
                 {
                     Item item = new Item(itemData);
-                    //item.durability = Mathf.Min(row.durability, item.maxDurability);
                     item.summonedHealth = row.summonedHealth;
                     item.summonedLevel = row.summonedLevel;
                     item.summonedExperience = row.summonedExperience;
@@ -383,14 +223,13 @@ public partial class Database : MonoBehaviour
 
         // then load valid equipment and put into their slots
         // (one big query is A LOT faster than querying each slot separately)
-        foreach (character_equipment row in connection.Query<character_equipment>("SELECT * FROM character_equipment WHERE character=?", equipment.name))
+        foreach (CharacterEquipment row in connection.Select<CharacterEquipment>(q => q.character == equipment.name))
         {
             if (row.slot < equipment.slotInfo.Length)
             {
                 if (ScriptableItem.All.TryGetValue(row.name.GetStableHashCode(), out ScriptableItem itemData))
                 {
                     Item item = new Item(itemData);
-                    //item.durability = Mathf.Min(row.durability, item.maxDurability);
                     item.summonedHealth = row.summonedHealth;
                     item.summonedLevel = row.summonedLevel;
                     item.summonedExperience = row.summonedExperience;
@@ -406,7 +245,7 @@ public partial class Database : MonoBehaviour
     {
         // then load cooldowns
         // (one big query is A LOT faster than querying each slot separately)
-        foreach (character_itemcooldowns row in connection.Query<character_itemcooldowns>("SELECT * FROM character_itemcooldowns WHERE character=?", player.name))
+        foreach (CharacterItemCooldown row in connection.Select<CharacterItemCooldown>(q => q.character == player.name))
         {
             // cooldownEnd is based on NetworkTime.time which will be different
             // when restarting a server, hence why we saved it as just the
@@ -428,7 +267,7 @@ public partial class Database : MonoBehaviour
 
         // then load learned skills and put into their slots
         // (one big query is A LOT faster than querying each slot separately)
-        foreach (character_skills row in connection.Query<character_skills>("SELECT * FROM character_skills WHERE character=?", skills.name))
+        foreach (CharacterSkill row in connection.Select<CharacterSkill>(q => q.character == skills.name))
         {
             int index = skills.GetSkillIndexByName(row.name);
             if (index != -1)
@@ -456,7 +295,7 @@ public partial class Database : MonoBehaviour
         // load buffs
         // note: no check if we have learned the skill for that buff
         //       since buffs may come from other people too
-        foreach (character_buffs row in connection.Query<character_buffs>("SELECT * FROM character_buffs WHERE character=?", skills.name))
+        foreach (CharacterBuff row in connection.Select<CharacterBuff>(q => q.character == skills.name))
         {
             if (ScriptableSkill.All.TryGetValue(row.name.GetStableHashCode(), out ScriptableSkill skillData))
             {
@@ -478,7 +317,7 @@ public partial class Database : MonoBehaviour
     void LoadQuests(PlayerQuests quests)
     {
         // load quests
-        foreach (character_quests row in connection.Query<character_quests>("SELECT * FROM character_quests WHERE character=?", quests.name))
+        foreach (CharacterQuest row in connection.Select<CharacterQuest>(q => q.character == quests.name))
         {
             ScriptableQuest questData;
             if (ScriptableQuest.All.TryGetValue(row.name.GetStableHashCode(), out questData))
@@ -499,7 +338,7 @@ public partial class Database : MonoBehaviour
     //    because we don't ever have to load guilds that aren't needed
     void LoadGuildOnDemand(PlayerGuild playerGuild)
     {
-        string guildName = connection.ExecuteScalar<string>("SELECT guild FROM character_guild WHERE character=?", playerGuild.name);
+        string guildName = connection.GetScalar<CharacterGuild, string>(x => x.guild, y => y.character == playerGuild.name);
         if (guildName != null)
         {
             // load guild on demand when the first player of that guild logs in
@@ -517,7 +356,9 @@ public partial class Database : MonoBehaviour
 
     public GameObject CharacterLoad(string characterName, List<Player> prefabs, bool isPreview)
     {
-        characters row = connection.FindWithQuery<characters>("SELECT * FROM characters WHERE name=? AND deleted=0", characterName);
+
+        Character row = connection.FirstOrDefault<Character>(q => q.name == characterName && q.deleted == false);
+
         if (row != null)
         {
             // instantiate based on the class name
@@ -527,17 +368,17 @@ public partial class Database : MonoBehaviour
                 GameObject go = Instantiate(prefab.gameObject);
                 Player player = go.GetComponent<Player>();
 
-                player.name                                   = row.name;
-                player.account                                = row.account;
-                player.className                              = row.classname;
-                Vector2 position                              = new Vector2(row.x, row.y);
-                player.level.current                          = Mathf.Min(row.level, player.level.max); // limit to max level in case we changed it
-                player.strength.value                         = row.strength;
-                player.intelligence.value                     = row.intelligence;
-                player.experience.current                     = row.experience;
+                player.name = row.name;
+                player.account = row.account;
+                player.className = row.classname;
+                Vector2 position = new Vector2(row.x, row.y);
+                player.level.current = Mathf.Min(row.level, player.level.max); // limit to max level in case we changed it
+                player.strength.value = row.strength;
+                player.intelligence.value = row.intelligence;
+                player.experience.current = row.experience;
                 ((PlayerSkills)player.skills).skillExperience = row.skillExperience;
-                player.gold                                   = row.gold;
-                player.itemMall.coins                         = row.coins;
+                player.gold = row.gold;
+                player.itemMall.coins = row.coins;
 
                 // can the player's movement type spawn on the saved position?
                 // it might not be if we changed the terrain, or if the player
@@ -578,7 +419,10 @@ public partial class Database : MonoBehaviour
                 // => don't set it when loading previews though. only when
                 //    really joining the world (hence setOnline flag)
                 if (!isPreview)
-                    connection.Execute("UPDATE characters SET online=1, lastsaved=? WHERE name=?", DateTime.UtcNow, characterName);
+                {
+                    row.online = true; row.lastsaved = DateTime.UtcNow;
+                    connection.Update<Character>(row);
+                }
 
                 // addon system hooks
                 onCharacterLoad.Invoke(player);
@@ -590,24 +434,23 @@ public partial class Database : MonoBehaviour
         return null;
     }
 
+
     void SaveInventory(PlayerInventory inventory)
     {
         // inventory: remove old entries first, then add all new ones
         // (we could use UPDATE where slot=... but deleting everything makes
         //  sure that there are never any ghosts)
-        connection.Execute("DELETE FROM character_inventory WHERE character=?", inventory.name);
+        connection.DeleteAll<CharacterInventory>(d => d.character == inventory.name);
         for (int i = 0; i < inventory.slots.Count; ++i)
         {
             ItemSlot slot = inventory.slots[i];
             if (slot.amount > 0) // only relevant items to save queries/storage/time
             {
-                // note: .Insert causes a 'Constraint' exception. use Replace.
-                connection.InsertOrReplace(new character_inventory{
+                connection.Insert(new CharacterInventory{
                     character = inventory.name,
                     slot = i,
                     name = slot.item.name,
                     amount = slot.amount,
-                    //durability = slot.item.durability,
                     summonedHealth = slot.item.summonedHealth,
                     summonedLevel = slot.item.summonedLevel,
                     summonedExperience = slot.item.summonedExperience
@@ -621,18 +464,17 @@ public partial class Database : MonoBehaviour
         // equipment: remove old entries first, then add all new ones
         // (we could use UPDATE where slot=... but deleting everything makes
         //  sure that there are never any ghosts)
-        connection.Execute("DELETE FROM character_equipment WHERE character=?", equipment.name);
+        connection.DeleteAll<CharacterEquipment>(d => d.character == equipment.name);
         for (int i = 0; i < equipment.slots.Count; ++i)
         {
             ItemSlot slot = equipment.slots[i];
             if (slot.amount > 0) // only relevant equip to save queries/storage/time
             {
-                connection.InsertOrReplace(new character_equipment{
+                connection.Insert(new CharacterEquipment{
                     character = equipment.name,
                     slot = i,
                     name = slot.item.name,
                     amount = slot.amount,
-                    //durability = slot.item.durability,
                     summonedHealth = slot.item.summonedHealth,
                     summonedLevel = slot.item.summonedLevel,
                     summonedExperience = slot.item.summonedExperience
@@ -646,7 +488,7 @@ public partial class Database : MonoBehaviour
         // equipment: remove old entries first, then add all new ones
         // (we could use UPDATE where slot=... but deleting everything makes
         //  sure that there are never any ghosts)
-        connection.Execute("DELETE FROM character_itemcooldowns WHERE character=?", player.name);
+        connection.DeleteAll<CharacterItemCooldown>(d => d.character == player.name);
         foreach (KeyValuePair<string, double> kvp in player.itemCooldowns)
         {
             // cooldownEnd is based on NetworkTime.time, which will be different
@@ -658,7 +500,7 @@ public partial class Database : MonoBehaviour
             float cooldown = player.GetItemCooldown(kvp.Key);
             if (cooldown > 0)
             {
-                connection.InsertOrReplace(new character_itemcooldowns{
+                connection.Insert(new CharacterItemCooldown{
                     character = player.name,
                     category = kvp.Key,
                     cooldownEnd = cooldown
@@ -670,7 +512,7 @@ public partial class Database : MonoBehaviour
     void SaveSkills(PlayerSkills skills)
     {
         // skills: remove old entries first, then add all new ones
-        connection.Execute("DELETE FROM character_skills WHERE character=?", skills.name);
+        connection.DeleteAll<CharacterSkill>(d => d.character == skills.name);
         foreach (Skill skill in skills.skills)
             if (skill.level > 0) // only learned skills to save queries/storage/time
             {
@@ -680,7 +522,7 @@ public partial class Database : MonoBehaviour
                 // note: this does NOT work when trying to save character data
                 //       shortly before closing the editor or game because
                 //       NetworkTime.time is 0 then.
-                connection.InsertOrReplace(new character_skills{
+                connection.Insert(new CharacterSkill{
                     character = skills.name,
                     name = skill.name,
                     level = skill.level,
@@ -693,7 +535,7 @@ public partial class Database : MonoBehaviour
     void SaveBuffs(PlayerSkills skills)
     {
         // buffs: remove old entries first, then add all new ones
-        connection.Execute("DELETE FROM character_buffs WHERE character=?", skills.name);
+        connection.DeleteAll<CharacterBuff>(d => d.character == skills.name);
         foreach (Buff buff in skills.buffs)
         {
             // buffTimeEnd is based on NetworkTime.time, which will be different
@@ -702,7 +544,7 @@ public partial class Database : MonoBehaviour
             // note: this does NOT work when trying to save character data
             //       shortly before closing the editor or game because
             //       NetworkTime.time is 0 then.
-            connection.InsertOrReplace(new character_buffs{
+            connection.Insert(new CharacterBuff{
                 character = skills.name,
                 name = buff.name,
                 level = buff.level,
@@ -714,10 +556,10 @@ public partial class Database : MonoBehaviour
     void SaveQuests(PlayerQuests quests)
     {
         // quests: remove old entries first, then add all new ones
-        connection.Execute("DELETE FROM character_quests WHERE character=?", quests.name);
+        connection.DeleteAll<CharacterQuest>(d => d.character == quests.name);
         foreach (Quest quest in quests.quests)
         {
-            connection.InsertOrReplace(new character_quests{
+            connection.Insert(new CharacterQuest{
                 character = quests.name,
                 name = quest.name,
                 progress = quest.progress,
@@ -732,7 +574,8 @@ public partial class Database : MonoBehaviour
         // only use a transaction if not called within SaveMany transaction
         if (useTransaction) connection.BeginTransaction();
 
-        connection.InsertOrReplace(new characters{
+        Character character = new Character
+        {
             name = player.name,
             account = player.account,
             classname = player.className,
@@ -749,7 +592,10 @@ public partial class Database : MonoBehaviour
             coins = player.itemMall.coins,
             online = online,
             lastsaved = DateTime.UtcNow
-        });
+        };
+
+        if (connection.FirstOrDefault<Character>(f => f.name == character.name) == null) connection.Insert<Character>(character);
+        else connection.Update<Character>(character);
 
         SaveInventory(player.inventory);
         SaveEquipment((PlayerEquipment)player.equipment);
@@ -763,7 +609,7 @@ public partial class Database : MonoBehaviour
         // addon system hooks
         onCharacterSave.Invoke(player);
 
-        if (useTransaction) connection.Commit();
+        if (useTransaction) connection.Transaction.Commit();
     }
 
     // save multiple characters at once (useful for ultra fast transactions)
@@ -772,13 +618,13 @@ public partial class Database : MonoBehaviour
         connection.BeginTransaction(); // transaction for performance
         foreach (Player player in players)
             CharacterSave(player, online, false);
-        connection.Commit(); // end transaction
+        connection.Transaction.Commit(); // end transaction
     }
 
     // guilds //////////////////////////////////////////////////////////////////
     public bool GuildExists(string guild)
     {
-        return connection.FindWithQuery<guild_info>("SELECT * FROM guild_info WHERE name=?", guild) != null;
+        return connection.FirstOrDefault<GuildInfo>(q => q.name == guild) != null;
     }
 
     Guild LoadGuild(string guildName)
@@ -789,21 +635,25 @@ public partial class Database : MonoBehaviour
         guild.name = guildName;
 
         // load guild info
-        guild_info info = connection.FindWithQuery<guild_info>("SELECT * FROM guild_info WHERE name=?", guildName);
+        GuildInfo info = connection.FirstOrDefault<GuildInfo>(q => q.name == guildName);
         if (info != null)
         {
             guild.notice = info.notice;
         }
 
+        Debug.Log("List: " + connection.Select<CharacterGuild>(q => q.guild == guildName));
+
         // load members list
-        List<character_guild> rows = connection.Query<character_guild>("SELECT * FROM character_guild WHERE guild=?", guildName);
-        GuildMember[] members = new GuildMember[rows.Count]; // avoid .ToList(). use array directly.
-        for (int i = 0; i < rows.Count; ++i)
+        var rows = connection.Select<CharacterGuild>(q => q.guild == guildName).ToArray();
+        GuildMember[] members = new GuildMember[rows.Count()]; // avoid .ToList(). use array directly.
+        Debug.Log("CharacterGuild Rows: " + rows.Count());
+        for (int i = 0; i < rows.Count(); ++i)
         {
-            character_guild row = rows[i];
+            CharacterGuild row = rows[i];
 
             GuildMember member = new GuildMember();
             member.name = row.character;
+            Debug.Log("Row Character: " + row.character);
             member.rank = (GuildRank)row.rank;
 
             // is this player online right now? then use runtime data
@@ -816,7 +666,7 @@ public partial class Database : MonoBehaviour
             {
                 member.online = false;
                 // note: FindWithQuery<characters> is easier than ExecuteScalar<int> because we need the null check
-                characters character = connection.FindWithQuery<characters>("SELECT * FROM characters WHERE name=?", member.name);
+                Character character = connection.FirstOrDefault<Character>(q => q.name == member.name);
                 member.level = character != null ? character.level : 1;
             }
 
@@ -831,31 +681,43 @@ public partial class Database : MonoBehaviour
         if (useTransaction) connection.BeginTransaction(); // transaction for performance
 
         // guild info
-        connection.InsertOrReplace(new guild_info{
-            name = guild.name,
-            notice = guild.notice
-        });
+        if (connection.FirstOrDefault<GuildInfo>(q => q.name == guild.name) != null)
+        {
+            connection.Update<GuildInfo>(new GuildInfo
+            {
+                name = guild.name,
+                notice = guild.notice
+            });
+        } 
+        else
+        {
+            connection.Insert<GuildInfo>(new GuildInfo
+            {
+                name = guild.name,
+                notice = guild.notice
+            });
+        }
 
         // members list
-        connection.Execute("DELETE FROM character_guild WHERE guild=?", guild.name);
+        connection.DeleteAll<CharacterGuild>(d => d.guild == guild.name);
         foreach (GuildMember member in guild.members)
         {
-            connection.InsertOrReplace(new character_guild{
+            connection.Insert(new CharacterGuild{
                 character = member.name,
                 guild = guild.name,
                 rank = (int)member.rank
             });
         }
 
-        if (useTransaction) connection.Commit(); // end transaction
+        if (useTransaction) connection.Transaction.Commit(); // end transaction
     }
 
     public void RemoveGuild(string guild)
     {
         connection.BeginTransaction(); // transaction for performance
-        connection.Execute("DELETE FROM guild_info WHERE name=?", guild);
-        connection.Execute("DELETE FROM character_guild WHERE guild=?", guild);
-        connection.Commit(); // end transaction
+        connection.DeleteAll<GuildInfo>(d => d.name == guild);
+        connection.DeleteAll<CharacterGuild>(d => d.guild == guild);
+        connection.Transaction.Commit(); // end transaction
     }
 
     // item mall ///////////////////////////////////////////////////////////////
@@ -870,12 +732,172 @@ public partial class Database : MonoBehaviour
         // note: we could just delete processed orders, but keeping them in the
         // database is easier for debugging / support.
         List<long> result = new List<long>();
-        List<character_orders> rows = connection.Query<character_orders>("SELECT * FROM character_orders WHERE character=? AND processed=0", characterName);
-        foreach (character_orders row in rows)
+        List<CharacterOrders> rows = connection.Select<CharacterOrders>(q => q.character == characterName && q.processed == false).ToList();
+        foreach (CharacterOrders row in rows)
         {
             result.Add(row.coins);
-            connection.Execute("UPDATE character_orders SET processed=1 WHERE orderid=?", row.orderid);
+            row.processed = true;
+            connection.Update<CharacterOrders>(row);
         }
         return result;
     }
+
+    //==============================================================================================================================================
+    // Models
+    #region Tables 
+    [Alias("accounts")]
+    [Schema(databaseName)]
+    public class Account
+    {
+        [PrimaryKey()]
+        public string name { get; set; }
+        public string password { get; set; }
+        // created & lastlogin for statistics like CCU/MAU/registrations/...
+        public DateTime created { get; set; }
+        public DateTime lastlogin { get; set; }
+        public bool banned { get; set; }
+        // clean
+    }
+
+    [Alias("characters")]
+    [Schema(databaseName)]
+    public class Character
+    {
+        [PrimaryKey()]
+        public string name { get; set; }
+        [Index()] // add index on account to avoid full scans when loading characters
+        public string account { get; set; }
+        public string classname { get; set; } // 'class' isn't available in C#
+        public float x { get; set; }
+        public float y { get; set; }
+        public int level { get; set; }
+        public int health { get; set; }
+        public int mana { get; set; }
+        public int strength { get; set; }
+        public int intelligence { get; set; }
+        public long experience { get; set; } // TODO does long work?
+        public long skillExperience { get; set; } // TODO does long work?
+        public long gold { get; set; } // TODO does long work?
+        public long coins { get; set; } // TODO does long work?
+        // online status can be checked from external programs with either just
+        // just 'online', or 'online && (DateTime.UtcNow - lastsaved) <= 1min)
+        // which is robust to server crashes too.
+        public bool online { get; set; }
+        public DateTime lastsaved { get; set; }
+        public bool deleted { get; set; }
+        //clean
+    }
+
+    [Alias("character_buffs")]
+    [Schema(databaseName)]
+    [CompositeIndex(true, new []{"character","name"})]
+    public class CharacterBuff
+    {
+        public string character { get; set; }
+        public string name { get; set; }
+        public int level { get; set; }
+        public float buffTimeEnd { get; set; }
+        //clean
+    }
+
+    [Alias("character_guild")]
+    [Schema(databaseName)]
+    public class CharacterGuild
+    {
+        // guild members are saved in a separate table because instead of in a
+        // characters.guild field because:
+        // * guilds need to be resaved independently, not just in CharacterSave
+        // * kicked members' guilds are cleared automatically because we drop
+        //   and then insert all members each time. otherwise we'd have to
+        //   update the kicked member's guild field manually each time
+        // * it's easier to remove / modify the guild feature if it's not hard-
+        //   coded into the characters table
+        [PrimaryKey()] // important for performance: O(log n) instead of O(n)
+        public string character { get; set; }
+        // add index on guild to avoid full scans when loading guild members
+        [Index()]
+        public string guild { get; set; }
+        public int rank { get; set; }
+        //clean
+    }
+
+    [Alias("character_inventory")]
+    [Schema(databaseName)]
+    [CompositeIndex(true, new []{"character","slot"})]
+    public class CharacterInventory
+    {
+        public string character { get; set; }
+        public int slot { get; set; }
+        public string name { get; set; }
+        public int amount { get; set; }
+        public int summonedHealth { get; set; }
+        public int summonedLevel { get; set; }
+        public long summonedExperience { get; set; }
+        //clean
+    }
+
+    [Alias("character_equipment")]
+    [Schema(databaseName)]
+    [CompositeIndex(true, new[] { "character", "slot" })]
+    class CharacterEquipment : CharacterInventory { } // same layout //clean
+
+    [Alias("character_itemcooldowns")]
+    [Schema(databaseName)]
+    class CharacterItemCooldown
+    {
+        [PrimaryKey()] // important for performance: O(log n) instead of O(n)
+        public string character { get; set; }
+        public string category { get; set; }
+        public float cooldownEnd { get; set; }
+        //clean
+    }
+
+    [Alias("character_orders")]
+    [Schema(databaseName)]
+    public class CharacterOrders
+    {
+        [PrimaryKey()] // important for performance: O(log n) instead of O(n)
+        public int orderid { get; set; }
+        public string character { get; set; }
+        public long coins { get; set; }
+        public bool processed { get; set; }
+        //clean
+    }
+
+    [Alias("character_quests")]
+    [Schema(databaseName)]
+    [CompositeIndex(true, new []{"character","name"})]
+    class CharacterQuest
+    {
+        public string character { get; set; }
+        public string name { get; set; }
+        public int progress { get; set; }
+        public bool completed { get; set; }
+        //clean
+    }
+
+    [Alias("character_skills")]
+    [Schema(databaseName)]
+    [CompositeIndex(true, new []{"character","name"})]
+    public class CharacterSkill
+    {
+        public string character { get; set; }
+        public string name { get; set; }
+        public int level { get; set; }
+        public float castTimeEnd { get; set; }
+        public float cooldownEnd { get; set; }
+        //clean
+    }
+
+    [Alias("guild_info")]
+    [Schema(databaseName)]
+    public class GuildInfo
+    {
+        // guild master is not in guild_info in case we need more than one later
+        [PrimaryKey()] // important for performance: O(log n) instead of O(n)
+        public string name { get; set; }
+        public string notice { get; set; }
+        //clean
+    }
+    #endregion
 }
